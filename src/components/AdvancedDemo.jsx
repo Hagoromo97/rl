@@ -1,12 +1,27 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import QrScanner from 'qr-scanner';
 import { Dialog } from 'primereact/dialog';
 import { OverlayPanel } from 'primereact/overlaypanel';
 import { MapContainer, TileLayer, CircleMarker, Popup, Polyline } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 
+// Inject badge-pop animation once
+(function () {
+    if (typeof document !== 'undefined' && !document.getElementById('rl-badge-pop-style')) {
+        const s = document.createElement('style');
+        s.id = 'rl-badge-pop-style';
+        s.textContent = [
+            '@keyframes rl-badge-pop { 0%{transform:scale(1)} 40%{transform:scale(1.38)} 70%{transform:scale(0.88)} 100%{transform:scale(1)} }',
+            '@keyframes rl-spin { to{transform:rotate(360deg)} }',
+            '@keyframes rl-toast-in { from{opacity:0;transform:translateY(16px) scale(0.95)} to{opacity:1;transform:translateY(0) scale(1)} }',
+            '@keyframes rl-float-in { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }',
+        ].join(' ');
+        document.head.appendChild(s);
+    }
+})();
+
 // ── Per-card datasets ────────────────────────────────────────────────────────
-const cardDatasets = [
+export const cardDatasets = [
     {
         title: 'Advanced Card',
         subTitle: 'New York, USA',
@@ -132,6 +147,8 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
     const [qrTab, setQrTab] = useState('url'); // 'url' | 'media'
     const [showQrEdit, setShowQrEdit] = useState(false);
     const [qrDecodeStatus, setQrDecodeStatus] = useState('idle'); // 'idle'|'loading'|'ok'|'fail'
+    const [isScanning, setIsScanning] = useState(false);
+    const [scannedUrl, setScannedUrl] = useState(null);
     const [pendingUrl, setPendingUrl] = useState(null);
     const qrFileRef = useRef(null);
 
@@ -202,21 +219,57 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
         setShowAvatarEdit(false);
     };
 
-    // ── QR decode from uploaded image
+    // ── QR: reusable decode helper
+    const decodeQrFromSource = async (source) => {
+        try {
+            const result = await QrScanner.scanImage(source, { returnDetailedScanResult: true });
+            return result?.data ?? null;
+        } catch {
+            return null;
+        }
+    };
+
+    // ── QR decode from uploaded file (DataURL so it persists after save)
     const handleQrFileChange = async (e) => {
         const file = e.target.files?.[0];
         if (!file) return;
         setQrDecodeStatus('loading');
-        setQrCodeImageUrl(URL.createObjectURL(file));
-        try {
-            const result = await QrScanner.scanImage(file, { returnDetailedScanResult: true });
-            const decoded = result?.data ?? '';
-            setQrDecodeStatus('ok');
-            if (decoded.startsWith('http')) setQrCodeDestUrl(decoded);
-        } catch {
-            setQrDecodeStatus('fail');
-        }
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+            const dataUrl = reader.result;
+            setQrCodeImageUrl(dataUrl);
+            const decoded = await decodeQrFromSource(file);
+            if (decoded) {
+                setQrDecodeStatus('ok');
+                if (decoded.startsWith('http')) setQrCodeDestUrl(decoded);
+            } else {
+                setQrDecodeStatus('fail');
+            }
+        };
+        reader.readAsDataURL(file);
         if (qrFileRef.current) qrFileRef.current.value = '';
+    };
+
+    // ── Scan QR image in view mode (fetch as blob first to bypass CORS)
+    const handleScanQr = async () => {
+        if (!qrCodeImageUrl) return;
+        setIsScanning(true);
+        await new Promise(r => setTimeout(r, 700));
+        try {
+            let source = qrCodeImageUrl;
+            if (qrCodeImageUrl.startsWith('http')) {
+                try {
+                    const res = await fetch(qrCodeImageUrl);
+                    if (res.ok) source = await res.blob();
+                } catch { /* CORS — fall back to URL string */ }
+            }
+            const decoded = await decodeQrFromSource(source);
+            setIsScanning(false);
+            setScannedUrl(decoded ?? qrCodeDestUrl ?? '');
+        } catch {
+            setIsScanning(false);
+            setScannedUrl(qrCodeDestUrl ?? '');
+        }
     };
 
     // ── Avatar upload
@@ -245,6 +298,57 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
 
     return (
         <>
+        {/* ── QR Scan result dialog ── */}
+        {scannedUrl !== null && (
+            <Dialog
+                baseZIndex={30000}
+                visible={scannedUrl !== null}
+                onHide={() => setScannedUrl(null)}
+                header={null}
+                headerStyle={{ display: 'none' }}
+                style={{ width: '320px', borderRadius: '14px', overflow: 'hidden' }}
+                contentStyle={{ padding: '1.5rem 1.25rem 1rem', background: darkMode ? '#1e293b' : '#fff' }}
+                modal dismissableMask closable={false}
+                footer={null}
+            >
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.75rem', textAlign: 'center' }}>
+                    <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#dcfce7', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <i className="pi pi-qrcode" style={{ fontSize: '1.2rem', color: '#16a34a' }} />
+                    </div>
+                    <div style={{ fontWeight: 700, fontSize: '0.92rem', color: darkMode ? '#f1f5f9' : '#1e293b' }}>QR Scanned</div>
+                    {scannedUrl ? (
+                        <>
+                            <div style={{ fontSize: '0.72rem', color: '#22c55e', display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+                                <i className="pi pi-check-circle" /> Link detected
+                            </div>
+                            <div style={{ background: darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9', borderRadius: '8px', padding: '0.5rem 0.75rem', width: '100%' }}>
+                                <div style={{ fontSize: '0.67rem', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '3px' }}>Destination</div>
+                                <div style={{ fontSize: '0.72rem', fontFamily: 'monospace', wordBreak: 'break-all', color: darkMode ? '#f1f5f9' : '#1e293b' }}>{scannedUrl}</div>
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ fontSize: '0.78rem', color: '#f87171', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                            <i className="pi pi-times-circle" /> No destination URL detected
+                        </div>
+                    )}
+                    <div style={{ display: 'flex', gap: '0.5rem', width: '100%', marginTop: '0.25rem' }}>
+                        <button onClick={() => setScannedUrl(null)} style={{
+                            flex: 1, padding: '0.45rem', borderRadius: '8px', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                            background: 'transparent', color: darkMode ? '#94a3b8' : '#64748b',
+                            border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+                        }}>Close</button>
+                        {scannedUrl && (
+                            <button onClick={() => { window.open(scannedUrl, '_blank'); setScannedUrl(null); }} style={{
+                                flex: 1, padding: '0.45rem', borderRadius: '8px', fontSize: '0.78rem', fontWeight: 700, cursor: 'pointer',
+                                background: markerColor, color: '#fff', border: 'none',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px',
+                            }}><i className="pi pi-external-link" style={{ fontSize: '0.7rem' }} /> Open</button>
+                        )}
+                    </div>
+                </div>
+            </Dialog>
+        )}
+
         {/* ── Confirm external URL dialog ── */}
         {pendingUrl && (
             <Dialog
@@ -433,6 +537,7 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                 </div>
 
                 {/* ── QR Code ── */}
+                {editMode && (
                 <div>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
                         {sectionLabel('QR Code')}
@@ -447,17 +552,8 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                     {/* QR Image preview */}
                     {qrCodeImageUrl ? (
                         <div style={{ position: 'relative', display: 'inline-block', marginBottom: showQrEdit ? '0.75rem' : 0 }}>
-                            <img src={qrCodeImageUrl} alt="QR" onClick={() => qrCodeDestUrl && handleOpenUrl(qrCodeDestUrl)} style={{ width: '100px', height: '100px', objectFit: 'contain', borderRadius: '10px', border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`, cursor: qrCodeDestUrl ? 'pointer' : 'default', display: 'block' }} />
-                            {qrCodeDestUrl && (
-                                <div style={{ position: 'absolute', inset: 0, borderRadius: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0)', transition: 'background 0.15s' }}
-                                    onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,0,0,0.25)'}
-                                    onMouseLeave={e => e.currentTarget.style.background = 'rgba(0,0,0,0)'}
-                                    onClick={() => handleOpenUrl(qrCodeDestUrl)}>
-                                    <i className="pi pi-external-link" style={{ color: '#fff', fontSize: '1.2rem', opacity: 0, transition: 'opacity 0.15s' }}
-                                        onMouseEnter={e => e.currentTarget.style.opacity = '1'}
-                                    />
-                                </div>
-                            )}
+                            <img src={qrCodeImageUrl} alt="QR"
+                                style={{ width: '100px', height: '100px', objectFit: 'contain', borderRadius: '10px', border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`, display: 'block' }} />
                             {editMode && showQrEdit && (
                                 <button onClick={() => { setQrCodeImageUrl(''); setQrDecodeStatus('idle'); }} style={{ position: 'absolute', top: '-7px', right: '-7px', width: '18px', height: '18px', borderRadius: '50%', background: '#ef4444', border: '2px solid #fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                                     <i className="pi pi-times" style={{ fontSize: '0.5rem', color: '#fff' }} />
@@ -507,9 +603,16 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                                                 if (!qrCodeImageUrl.trim()) return;
                                                 setQrDecodeStatus('loading');
                                                 try {
-                                                    const result = await QrScanner.scanImage(qrCodeImageUrl, { returnDetailedScanResult: true });
-                                                    if (result?.data?.startsWith('http')) setQrCodeDestUrl(result.data);
-                                                    setQrDecodeStatus('ok');
+                                                    let source = qrCodeImageUrl;
+                                                    if (qrCodeImageUrl.startsWith('http')) {
+                                                        try {
+                                                            const res = await fetch(qrCodeImageUrl);
+                                                            if (res.ok) source = await res.blob();
+                                                        } catch { /* CORS fallback */ }
+                                                    }
+                                                    const decoded = await decodeQrFromSource(source);
+                                                    if (decoded?.startsWith('http')) setQrCodeDestUrl(decoded);
+                                                    setQrDecodeStatus(decoded ? 'ok' : 'fail');
                                                 } catch { setQrDecodeStatus('fail'); }
                                             }} style={{ padding: '0.38rem 0.6rem', borderRadius: '7px', background: darkMode ? 'rgba(255,255,255,0.08)' : '#f1f5f9', color: darkMode ? '#94a3b8' : '#64748b', border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`, cursor: 'pointer', fontSize: '0.7rem', fontWeight: 700, whiteSpace: 'nowrap' }}>Scan</button>
                                         )}
@@ -532,7 +635,7 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                         </div>
                     )}
 
-                    {/* Destination URL display (view mode) */}
+                    {/* Destination URL (edit mode only) */}
                     {!showQrEdit && qrCodeDestUrl && (
                         <button onClick={() => handleOpenUrl(qrCodeDestUrl)} style={{ marginTop: '0.4rem', display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', fontWeight: 600, color: markerColor, background: 'none', border: 'none', cursor: 'pointer', padding: '0', maxWidth: '100%' }}>
                             <i className="pi pi-link" style={{ fontSize: '0.68rem' }} />
@@ -540,17 +643,18 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                         </button>
                     )}
                 </div>
+                )}
 
                 {/* ── Navigation ── */}
                 {hasCoords && (
                     <div>
                         {sectionLabel('Open With')}
-                        <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', justifyContent: 'center', gap: '0.25rem', marginTop: '0.5rem', flexWrap: 'wrap' }}>
                             {[
-                                { label: 'Google Maps', bg: '#ea4335', icon: 'pi-map-marker', url: gmapsUrl },
-                                { label: 'Waze',        bg: '#33ccff', icon: 'pi-directions',  url: wazeUrl  },
+                                { label: 'Maps', bg: '#ea4335', icon: 'pi-map-marker', url: gmapsUrl },
+                                { label: 'Waze', bg: '#33ccff', icon: 'pi-directions',  url: wazeUrl  },
                             ].map(btn => (
-                                <button key={btn.label} onClick={() => handleOpenUrl(btn.url)} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', padding: '0.4rem 0.75rem', borderRadius: '10px', transition: 'background 0.15s' }}
+                                <button key={btn.label} onClick={() => handleOpenUrl(btn.url)} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', padding: '0.4rem 0.6rem', borderRadius: '10px', transition: 'background 0.15s', minWidth: '60px' }}
                                     onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
                                     onMouseLeave={e => e.currentTarget.style.background = 'none'}>
                                     <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: btn.bg, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.18)', transition: 'transform 0.15s' }}
@@ -562,8 +666,29 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                                 </button>
                             ))}
 
+                            {/* QR Scan Button */}
+                            {qrCodeImageUrl && (
+                                <button
+                                    onClick={() => editMode ? setShowQrEdit(p => !p) : handleScanQr()}
+                                    disabled={isScanning}
+                                    style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: isScanning ? 'not-allowed' : 'pointer', padding: '0.4rem 0.6rem', borderRadius: '10px', transition: 'background 0.15s', opacity: isScanning ? 0.7 : 1, minWidth: '60px' }}
+                                    onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                    onMouseLeave={e => e.currentTarget.style.background = 'none'}
+                                    title={editMode ? 'Edit QR Code' : 'Scan QR Code'}
+                                >
+                                    <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: '#f97316', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.18)', transition: 'transform 0.15s' }}
+                                        onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.08)'}
+                                        onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}>
+                                        {isScanning
+                                            ? <i className="pi pi-spin pi-spinner" style={{ color: '#fff', fontSize: '1rem' }} />
+                                            : <i className="pi pi-qrcode" style={{ color: '#fff', fontSize: '1rem' }} />}
+                                    </div>
+                                    <span style={{ fontSize: '0.65rem', fontWeight: 600, color: darkMode ? '#94a3b8' : '#64748b' }}>QR</span>
+                                </button>
+                            )}
+
                             {/* FamilyMart Refill Service */}
-                            <button onClick={() => handleOpenUrl('https://erefill.speedparcel.com.my/')} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', padding: '0.4rem 0.75rem', borderRadius: '10px', transition: 'background 0.15s' }}
+                            <button onClick={() => handleOpenUrl('https://erefill.speedparcel.com.my/')} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '5px', background: 'none', border: 'none', cursor: 'pointer', padding: '0.4rem 0.6rem', borderRadius: '10px', transition: 'background 0.15s', minWidth: '60px' }}
                                 onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
                                 onMouseLeave={e => e.currentTarget.style.background = 'none'}>
                                 <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: 'linear-gradient(135deg, #16a34a, #15803d)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 2px 8px rgba(0,0,0,0.18)', transition: 'transform 0.15s' }}
@@ -571,7 +696,7 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
                                     onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}>
                                     <i className="pi pi-refresh" style={{ color: '#fff', fontSize: '1rem' }} />
                                 </div>
-                                <span style={{ fontSize: '0.65rem', fontWeight: 600, color: darkMode ? '#94a3b8' : '#64748b', textAlign: 'center', lineHeight: 1.2 }}>Refill<br/>Service</span>
+                                <span style={{ fontSize: '0.65rem', fontWeight: 600, color: darkMode ? '#94a3b8' : '#64748b' }}>FM</span>
                             </button>
                         </div>
                     </div>
@@ -583,15 +708,28 @@ function RowInfoPanel({ open, onOpenChange, row, darkMode, markerColor, onSave, 
 }
 
 // ── CardItem ─────────────────────────────────────────────────────────────────
-function CardItem({ title, subTitle, description, tags, date, darkMode, editMode, markerColor: initialMarkerColor, routeColor, rows, index }) {
+function CardItem({ title, subTitle, description, tags, date, darkMode, editMode, markerColor: initialMarkerColor, routeColor, rows, index, otherCards = [], onMoveRows, externalRowOp, onToast, onDirty, onDeleteCard }) {
     const [markerColor, setMarkerColor] = useState(initialMarkerColor);
-    const [tableRows, setTableRows] = useState(() => rows.map(r => ({ ...r, descriptions: r.descriptions ?? [] })));
+    const [tableRows, setTableRows] = useState(() =>
+        rows
+            .map(r => ({ ...r, descriptions: r.descriptions ?? [] }))
+            .sort((a, b) => parseFloat(a.code) - parseFloat(b.code))
+    );
     const [dialogVisible, setDialogVisible] = useState(false);
     const [activeTab, setActiveTab] = useState('map');
     const [selectedRows, setSelectedRows] = useState([]);
     const [showChangelog, setShowChangelog] = useState(false);
     const [showEditPanel, setShowEditPanel] = useState(false);
     const [editPanelSnapshot, setEditPanelSnapshot] = useState(null);
+    const [confirmDeleteRoute, setConfirmDeleteRoute] = useState(false);
+    const [settingsVisible, setSettingsVisible] = useState(false);
+    const [settingsPage, setSettingsPage] = useState('menu');
+    const [visibleCols, setVisibleCols] = useState({ no: true, code: true, name: true, delivery: true, km: true, latitude: true, longitude: true });
+    const [colOrder, setColOrder] = useState(['no','code','name','delivery','km','latitude','longitude']);
+    const [rowSize, setRowSize] = useState('normal');
+    const [sortCfg, setSortCfg] = useState({ field: 'no', direction: 'asc' });
+    const [rowNums, setRowNums] = useState({});
+    const [savedSortList, setSavedSortList] = useState([]);
     const [changelog, setChangelog] = useState(() => [{ date: new Date(date), names: rows.map(r => r.name) }]);
     const [addingRow, setAddingRow] = useState(null);
     const [infoRow, setInfoRow] = useState(null);
@@ -600,6 +738,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
     const titleOp = useRef(null);
     const cellOp = useRef(null);
     const [editingCell, setEditingCell] = useState(null); // { rowNo, field, value }
+    const [editingCellOriginal, setEditingCellOriginal] = useState('');
     const [, code] = subTitle.split(', ');
     const [editShift, setEditShift] = useState('AM');
     const [editCode, setEditCode] = useState(code);
@@ -620,9 +759,33 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
         return () => clearInterval(id);
     }, []);
 
+    // Clear selections when leaving edit mode
     useEffect(() => {
-        if (!editMode && showEditPanel) setShowEditPanel(false);
+        if (!editMode) setSelectedRows([]);
     }, [editMode]);
+
+    // Action modal state
+    const [showActionModal, setShowActionModal] = useState(false);
+    const [actionStep, setActionStep] = useState('menu'); // 'menu' | 'move' | 'delete-confirm'
+    const [selectedTargetCard, setSelectedTargetCard] = useState('');
+    const [badgeAnimKey, setBadgeAnimKey] = useState(0);
+    const [actionLoading, setActionLoading] = useState(false);
+
+    // Animate badge each time selection count changes
+    useEffect(() => {
+        if (selectedRows.length > 0) setBadgeAnimKey(k => k + 1);
+    }, [selectedRows.length]);
+
+    // Receive rows moved in from another card
+    useEffect(() => {
+        if (!externalRowOp) return;
+        const maxNo = tableRows.length > 0 ? Math.max(...tableRows.map(r => r.no)) : 0;
+        const newRows = externalRowOp.rows.map((r, idx) => ({ ...r, no: maxNo + idx + 1 }));
+        setTableRows(prev => [...prev, ...newRows].sort((a, b) => parseFloat(a.code) - parseFloat(b.code)));
+        setChangelog(prev => [...prev, { date: new Date(), names: newRows.map(r => r.name), action: 'moved in' }]);
+        onDirty?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [externalRowOp?.id]);
 
     const timeAgo = (d) => {
         const now = new Date();
@@ -735,6 +898,18 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
         </>
     );
 
+    const displayRows = useMemo(() => {
+        const f = sortCfg.field;
+        return [...tableRows].sort((a, b) => {
+            const dir = sortCfg.direction === 'asc' ? 1 : -1;
+            const fa = a[f], fb = b[f];
+            if (typeof fa === 'number' && typeof fb === 'number') return (fa - fb) * dir;
+            return String(fa ?? '').localeCompare(String(fb ?? '')) * dir;
+        });
+    }, [tableRows, sortCfg]);
+    const rowPad     = rowSize === 'compact' ? '0.28rem 1rem'    : rowSize === 'relaxed' ? '0.85rem 1rem'    : '0.55rem 1rem';
+    const rowPadCell = rowSize === 'compact' ? '0.28rem 0.75rem' : rowSize === 'relaxed' ? '0.85rem 0.75rem' : '0.55rem 0.75rem';
+
     const btnBase = {
         flex: 1, borderRadius: '8px', fontSize: '0.8rem', fontWeight: 600,
         padding: '0.45rem 0', justifyContent: 'center',
@@ -775,8 +950,49 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
             return;
         }
         setEditingCell({ rowNo, field, value: String(currentVal) });
+        setEditingCellOriginal(String(currentVal));
         cellOp.current.show(e);
     };
+
+    const cellDirty = editingCell != null && editingCell.value !== editingCellOriginal;
+
+    // Code field: duplicate detection across own rows and other cards
+    const codeConflict = (() => {
+        if (editingCell?.field !== 'code' || !editingCell.value.trim()) return null;
+        const val = editingCell.value.trim();
+        // same card, different row
+        const sameCard = tableRows.find(r => r.no !== editingCell.rowNo && String(r.code) === val);
+        if (sameCard) return 'Code already exists in this route';
+        // other cards
+        for (const oc of otherCards) {
+            if ((oc.rows ?? []).some(r => String(r.code) === val)) {
+                return `Code already exists at ${oc.title}`;
+            }
+        }
+        return null;
+    })();
+
+    // Add-row code duplicate detection
+    const addRowCodeConflict = (() => {
+        const val = (addingRow?.code ?? '').trim();
+        if (!val) return null;
+        if (tableRows.some(r => String(r.code) === val)) return 'Code already exists in this route';
+        for (const oc of otherCards) {
+            if ((oc.rows ?? []).some(r => String(r.code) === val)) {
+                return `Code already exists at ${oc.title}`;
+            }
+        }
+        return null;
+    })();
+
+    const editPanelDirty = editPanelSnapshot != null && (
+        editTitle !== editPanelSnapshot.title ||
+        editDescription !== (editPanelSnapshot.description ?? '') ||
+        editCode !== editPanelSnapshot.code ||
+        editShift !== editPanelSnapshot.shift ||
+        markerColor !== editPanelSnapshot.color ||
+        JSON.stringify(editTags) !== JSON.stringify(editPanelSnapshot.tags ?? [])
+    );
 
     const handleCellSave = () => {
         if (!editingCell) return;
@@ -789,6 +1005,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
             return { ...r, [field]: parsed };
         }));
         setLastModified(new Date());
+        onDirty?.();
         cellOp.current.hide();
         setEditingCell(null);
     };
@@ -800,6 +1017,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
 
     const handleAddRow = () => {
         if (!addingRow || !addingRow.name.trim()) return;
+        if (addRowCodeConflict) return;
         const newNo = tableRows.length > 0 ? Math.max(...tableRows.map(r => r.no)) + 1 : 1;
         const newRow = {
             no: newNo,
@@ -811,9 +1029,10 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
             longitude: parseFloat(addingRow.longitude) || 0,
             descriptions: [],
         };
-        setTableRows(prev => [...prev, newRow]);
+        setTableRows(prev => [...prev, newRow].sort((a, b) => parseFloat(a.code) - parseFloat(b.code)));
         setChangelog(prev => [...prev, { date: new Date(), names: [newRow.name] }]);
         setLastModified(new Date());
+        onDirty?.();
         setAddingRow(null);
     };
 
@@ -821,6 +1040,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
         setTableRows(prev => prev.map(r => r.no === updatedRow.no ? updatedRow : r));
         setInfoRow(updatedRow);
         setLastModified(new Date());
+        onDirty?.();
     };
 
     const footer = (
@@ -1007,11 +1227,12 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px', flexShrink: 0 }}>
                                 <div style={{
                                     width: '24px', height: '24px', borderRadius: '50%',
-                                    background: isInit ? `${markerColor}22` : '#06b6d422',
-                                    border: `2px solid ${isInit ? markerColor : '#06b6d4'}`,
+                                    background: isInit ? `${markerColor}22` : entry.action === 'deleted' ? 'rgba(239,68,68,0.15)' : entry.action === 'moved out' ? 'rgba(245,158,11,0.15)' : entry.action === 'moved in' ? 'rgba(16,185,129,0.15)' : '#06b6d422',
+                                    border: `2px solid ${isInit ? markerColor : entry.action === 'deleted' ? '#ef4444' : entry.action === 'moved out' ? '#f59e0b' : entry.action === 'moved in' ? '#10b981' : '#06b6d4'}`,
                                     display: 'flex', alignItems: 'center', justifyContent: 'center',
                                 }}>
-                                    <i className={`pi ${isInit ? 'pi-flag' : 'pi-plus'}`} style={{ fontSize: '0.55rem', color: isInit ? markerColor : '#06b6d4' }} />
+                                    <i className={`pi ${isInit ? 'pi-flag' : entry.action === 'deleted' ? 'pi-trash' : entry.action === 'moved out' ? 'pi-arrow-up-right' : entry.action === 'moved in' ? 'pi-arrow-down-left' : 'pi-plus'}`}
+                                        style={{ fontSize: '0.55rem', color: isInit ? markerColor : entry.action === 'deleted' ? '#ef4444' : entry.action === 'moved out' ? '#f59e0b' : entry.action === 'moved in' ? '#10b981' : '#06b6d4' }} />
                                 </div>
                                 {i < changelog.length - 1 && (
                                     <div style={{ width: '2px', flex: 1, minHeight: '12px', background: darkMode ? 'rgba(255,255,255,0.07)' : '#e2e8f0', borderRadius: '1px' }} />
@@ -1024,7 +1245,13 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                 <div style={{ fontSize: '0.78rem', color: darkMode ? '#cbd5e1' : '#334155', fontWeight: 500, lineHeight: 1.4 }}>
                                     {isInit
                                         ? <><span style={{ fontWeight: 700, color: markerColor }}>Route created</span> with {entry.names.length} location{entry.names.length > 1 ? 's' : ''}: <span style={{ fontStyle: 'italic' }}>{nameList}</span></>
-                                        : <>Added {entry.names.length} location{entry.names.length > 1 ? 's' : ''}: <span style={{ fontWeight: 700, color: '#06b6d4' }}>{nameList}</span></>
+                                        : entry.action === 'moved out'
+                                            ? <>Moved <strong>{entry.names.length}</strong> location{entry.names.length > 1 ? 's' : ''} out: <span style={{ fontWeight: 700, color: '#f59e0b' }}>{nameList}</span></>
+                                            : entry.action === 'moved in'
+                                                ? <>Received <strong>{entry.names.length}</strong> location{entry.names.length > 1 ? 's' : ''}: <span style={{ fontWeight: 700, color: '#10b981' }}>{nameList}</span></>
+                                                : entry.action === 'deleted'
+                                                    ? <>Deleted <strong>{entry.names.length}</strong> location{entry.names.length > 1 ? 's' : ''}: <span style={{ fontWeight: 700, color: '#ef4444' }}>{nameList}</span></>
+                                                    : <>Added {entry.names.length} location{entry.names.length > 1 ? 's' : ''}: <span style={{ fontWeight: 700, color: '#06b6d4' }}>{nameList}</span></>
                                     }
                                 </div>
                             </div>
@@ -1357,16 +1584,85 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                     onMouseLeave={e => { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'; }}
                 ><i className="pi pi-times" style={{ fontSize: '0.72rem' }} /> Cancel</button>
                 <button
-                    onClick={() => { setLastModified(new Date()); setNewTagInput(''); setEditingTagIdx(null); setConfirmDeleteTag(null); setShowEditPanel(false); }}
+                    disabled={!editPanelDirty}
+                    onClick={() => { setLastModified(new Date()); onDirty?.(); setNewTagInput(''); setEditingTagIdx(null); setConfirmDeleteTag(null); setShowEditPanel(false); }}
                     style={{
                         flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem',
                         padding: '0.5rem 0', borderRadius: '8px',
-                        background: markerColor, color: '#fff', border: 'none',
-                        fontSize: '0.8rem', fontWeight: 700, cursor: 'pointer', transition: 'opacity 0.15s',
+                        background: editPanelDirty ? markerColor : (darkMode ? '#334155' : '#e2e8f0'),
+                        color: editPanelDirty ? '#fff' : (darkMode ? '#475569' : '#94a3b8'),
+                        border: 'none', fontSize: '0.8rem', fontWeight: 700,
+                        cursor: editPanelDirty ? 'pointer' : 'not-allowed',
+                        transition: 'all 0.2s', opacity: 1,
                     }}
-                    onMouseEnter={e => e.currentTarget.style.opacity = '0.85'}
-                    onMouseLeave={e => e.currentTarget.style.opacity = '1'}
-                ><i className="pi pi-check" style={{ fontSize: '0.72rem' }} /> Save</button>
+                    onMouseEnter={e => { if (editPanelDirty) e.currentTarget.style.opacity = '0.85'; }}
+                    onMouseLeave={e => { e.currentTarget.style.opacity = '1'; }}
+                ><i className="pi pi-check" style={{ fontSize: '0.72rem' }} /> Change</button>
+            </div>
+
+            {/* ── Delete Route ── */}
+            <div style={{
+                padding: '0 1.25rem 1.1rem',
+                background: darkMode ? '#1e293b' : '#ffffff',
+                flexShrink: 0,
+            }}>
+                {confirmDeleteRoute ? (
+                    <div style={{
+                        borderRadius: '10px', overflow: 'hidden',
+                        border: `1.5px solid ${darkMode ? 'rgba(239,68,68,0.4)' : '#fca5a5'}`,
+                        background: darkMode ? 'rgba(239,68,68,0.08)' : '#fff5f5',
+                        animation: 'rl-float-in 0.2s ease-out',
+                    }}>
+                        <div style={{ padding: '0.65rem 0.9rem 0.55rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <i className="pi pi-exclamation-triangle" style={{ fontSize: '0.82rem', color: '#ef4444' }} />
+                            <span style={{ fontSize: '0.78rem', fontWeight: 700, color: darkMode ? '#f87171' : '#dc2626' }}>Delete this route?</span>
+                        </div>
+                        <p style={{ margin: '0 0.9rem 0.65rem', fontSize: '0.74rem', color: darkMode ? '#94a3b8' : '#64748b', lineHeight: 1.5 }}>
+                            This will permanently remove <strong>{editTitle}</strong> and all its locations. This cannot be undone.
+                        </p>
+                        <div style={{ display: 'flex', gap: '0.4rem', padding: '0 0.9rem 0.75rem' }}>
+                            <button
+                                onClick={() => setConfirmDeleteRoute(false)}
+                                style={{
+                                    flex: 1, padding: '0.42rem 0', borderRadius: '8px', border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+                                    background: 'transparent', color: darkMode ? '#94a3b8' : '#64748b',
+                                    fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                            >Cancel</button>
+                            <button
+                                onClick={() => { onDeleteCard?.(); }}
+                                style={{
+                                    flex: 1, padding: '0.42rem 0', borderRadius: '8px', border: 'none',
+                                    background: 'linear-gradient(135deg, #ef4444, #dc2626)',
+                                    color: '#fff', fontSize: '0.78rem', fontWeight: 700, cursor: 'pointer',
+                                    boxShadow: '0 2px 8px rgba(239,68,68,0.4)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.35rem',
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.opacity = '0.88'}
+                                onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+                            ><i className="pi pi-trash" style={{ fontSize: '0.7rem' }} /> Yes, Delete</button>
+                        </div>
+                    </div>
+                ) : (
+                    <button
+                        onClick={() => setConfirmDeleteRoute(true)}
+                        style={{
+                            width: '100%', padding: '0.45rem 0', borderRadius: '8px',
+                            border: `1px solid ${darkMode ? 'rgba(239,68,68,0.25)' : '#fca5a5'}`,
+                            background: 'transparent',
+                            color: darkMode ? '#f87171' : '#ef4444',
+                            fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem',
+                            transition: 'all 0.15s',
+                        }}
+                        onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.08)' : '#fff5f5'; e.currentTarget.style.borderColor = '#ef4444'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = darkMode ? 'rgba(239,68,68,0.25)' : '#fca5a5'; }}
+                    >
+                        <i className="pi pi-trash" style={{ fontSize: '0.7rem' }} /> Delete Route
+                    </button>
+                )}
             </div>
         </div>{/* end Panel 3 */}
 
@@ -1449,32 +1745,67 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                 <i className="pi pi-list" style={{ fontSize: '0.65rem' }} />
                                 {tableRows.length} records
                             </span>
-                            {selectedRows.length > 0 && (
-                                <span style={{
-                                    display: 'inline-flex', alignItems: 'center', gap: '0.3rem',
-                                    background: darkMode ? `${markerColor}30` : `${markerColor}18`,
-                                    color: markerColor, border: `1px solid ${markerColor}44`,
-                                    fontSize: '0.72rem', fontWeight: 700, padding: '0.25rem 0.65rem', borderRadius: '6px',
-                                }}>
-                                    <i className="pi pi-check-square" style={{ fontSize: '0.65rem' }} />
-                                    {selectedRows.length} selected
-                                </span>
-                            )}
-                        </div>
-                        <div style={{ display: 'flex', gap: '0.5rem' }}>
-                            {selectedRows.length > 0 && (
+                            {editMode && selectedRows.length > 0 && (
                                 <button onClick={() => setSelectedRows([])}
                                     style={{
                                         display: 'flex', alignItems: 'center', gap: '0.35rem',
                                         background: darkMode ? 'rgba(239,68,68,0.15)' : '#fef2f2',
                                         color: '#ef4444',
                                         border: `1px solid ${darkMode ? 'rgba(239,68,68,0.3)' : '#fecaca'}`,
-                                        borderRadius: '8px', padding: '0.4rem 0.9rem', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                                        borderRadius: '6px', padding: '0.25rem 0.65rem', fontSize: '0.72rem', fontWeight: 600, cursor: 'pointer',
                                     }}
                                     onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.25)' : '#fee2e2'; }}
                                     onMouseLeave={e => { e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.15)' : '#fef2f2'; }}
                                 >
-                                    <i className="pi pi-times" style={{ fontSize: '0.7rem' }} /> Clear
+                                    <i className="pi pi-times" style={{ fontSize: '0.65rem' }} /> Clear
+                                </button>
+                            )}
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                            {!editMode && (
+                                <button
+                                    onClick={() => { setSettingsPage('menu'); setSettingsVisible(true); }}
+                                    style={{
+                                        display: 'flex', alignItems: 'center', gap: '0.35rem',
+                                        background: 'transparent',
+                                        color: darkMode ? '#64748b' : '#94a3b8',
+                                        border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+                                        borderRadius: '8px', padding: '0.4rem 0.8rem',
+                                        fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                                        transition: 'all 0.15s',
+                                    }}
+                                    onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'; e.currentTarget.style.color = darkMode ? '#94a3b8' : '#64748b'; }}
+                                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = darkMode ? '#64748b' : '#94a3b8'; }}
+                                >
+                                    <i className="pi pi-cog" style={{ fontSize: '0.78rem' }} /> Settings
+                                </button>
+                            )}
+                            {editMode && selectedRows.length > 0 && (
+                                <button onClick={() => { setActionStep('menu'); setSelectedTargetCard(''); setShowActionModal(true); }}
+                                    style={{
+                                        position: 'relative',
+                                        display: 'flex', alignItems: 'center', gap: '0.35rem',
+                                        background: darkMode ? `${markerColor}22` : `${markerColor}0f`,
+                                        color: markerColor,
+                                        border: `1px solid ${markerColor}55`,
+                                        borderRadius: '8px', padding: '0.4rem 0.9rem', fontSize: '0.78rem', fontWeight: 600, cursor: 'pointer',
+                                    }}
+                                    onMouseEnter={e => { e.currentTarget.style.background = darkMode ? `${markerColor}33` : `${markerColor}1e`; }}
+                                    onMouseLeave={e => { e.currentTarget.style.background = darkMode ? `${markerColor}22` : `${markerColor}0f`; }}
+                                >
+                                    <i className="pi pi-bolt" style={{ fontSize: '0.7rem' }} /> Actions
+                                    <span key={badgeAnimKey} style={{
+                                        position: 'absolute', top: '-7px', right: '-7px',
+                                        minWidth: '18px', height: '18px', borderRadius: '9px',
+                                        background: markerColor, color: '#fff',
+                                        fontSize: '0.62rem', fontWeight: 800,
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                        padding: '0 4px', lineHeight: 1, boxSizing: 'border-box',
+                                        boxShadow: `0 0 0 2px ${darkMode ? '#1e293b' : '#fff'}`,
+                                        animation: 'rl-badge-pop 0.35s ease-out',
+                                    }}>
+                                        {selectedRows.length}
+                                    </span>
                                 </button>
                             )}
                         </div>
@@ -1492,18 +1823,22 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                         <table style={{ borderCollapse: 'collapse', width: '100%', minWidth: '50rem' }}>
                             <thead>
                                 <tr style={{ background: darkMode ? '#1e293b' : '#f1f5f9', position: 'sticky', top: 0, zIndex: 10 }}>
-                                    {(editMode ? ['', 'No', 'Code', 'Name', 'Delivery', 'Km', 'Latitude', 'Longitude', 'Action'] : ['No', 'Code', 'Name', 'Delivery', 'Km', 'Latitude', 'Longitude', 'Action']).map((h, i) => (
-                                        <th key={i} style={{
+                                    {[
+                                        ...(editMode ? [{ key: '_cb', label: '' }] : []),
+                                        ...colOrder.filter(k => visibleCols[k]).map(k => ({ key: k, label: k === 'no' ? 'No' : k === 'km' ? 'Km' : k.charAt(0).toUpperCase() + k.slice(1) })),
+                                        { key: '_action', label: 'Action' },
+                                    ].map(col => (
+                                        <th key={col.key} style={{
                                             padding: '0.65rem 1rem', textAlign: 'center',
                                             fontSize: '0.72rem', fontWeight: 700, textTransform: 'uppercase',
                                             letterSpacing: '0.07em', color: darkMode ? '#94a3b8' : '#64748b',
                                             border: 'none', whiteSpace: 'nowrap',
-                                        }}>{h}</th>
+                                        }}>{col.label}</th>
                                     ))}
                                 </tr>
                             </thead>
                             <tbody>
-                                {tableRows.map((row, idx) => {
+                                {displayRows.map((row, idx) => {
                                     const checked = selectedRows.includes(row.no);
                                     const isOdd = idx % 2 !== 0;
                                     return (
@@ -1520,24 +1855,22 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                             ) : undefined}
                                         >
                                             {editMode && (
-                                            <td style={{ padding: '0.55rem 1rem', textAlign: 'center', border: 'none' }}>
+                                            <td style={{ padding: rowPad, textAlign: 'center', border: 'none' }}>
                                                 <input type="checkbox" checked={checked} onChange={() => {}}
                                                     style={{ accentColor: markerColor, width: '14px', height: '14px', cursor: 'pointer' }} />
                                             </td>
                                             )}
-                                            <td style={{ padding: '0.55rem 1rem', textAlign: 'center', border: 'none' }}>
-                                                <span style={{
-                                                    display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                                                    width: '20px', height: '20px', borderRadius: '50%',
-                                                    background: markerColor, color: '#fff', fontSize: '0.65rem', fontWeight: 700,
-                                                }}>{row.no}</span>
-                                            </td>
-                                            {['code', 'name', 'delivery', 'km', 'latitude', 'longitude'].map(field => {
+                                            {colOrder.filter(k => visibleCols[k]).map(field => {
+                                                if (field === 'no') return (
+                                                    <td key="no" style={{ padding: rowPad, textAlign: 'center', border: 'none' }}>
+                                                        <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '20px', height: '20px', borderRadius: '50%', background: markerColor, color: '#fff', fontSize: '0.65rem', fontWeight: 700 }}>{row.no}</span>
+                                                    </td>
+                                                );
                                                 const isDeliveryField = field === 'delivery';
                                                 const active = isDeliveryField ? isDeliveryActive(row.delivery) : false;
                                                 return (
                                                 <td key={field} style={{
-                                                    padding: '0.55rem 0.75rem', textAlign: 'center', fontSize: '0.82rem',
+                                                    padding: rowPadCell, textAlign: 'center', fontSize: '0.82rem',
                                                     color: darkMode ? '#cbd5e1' : '#334155', border: 'none', whiteSpace: 'nowrap',
                                                     cursor: editMode ? 'pointer' : 'default', position: 'relative',
                                                 }}
@@ -1571,7 +1904,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                                 </td>
                                                 );
                                             })}
-                                            <td style={{ padding: '0.55rem 1rem', textAlign: 'center', border: 'none' }}>
+                                            <td style={{ padding: rowPad, textAlign: 'center', border: 'none' }}>
                                                 <button
                                                     onClick={e => { e.stopPropagation(); setInfoRow(row); }}
                                                     style={{ background: 'none', border: 'none', cursor: 'pointer', color: markerColor, fontSize: '1rem', padding: '0.2rem 0.4rem', borderRadius: '6px' }}
@@ -1590,7 +1923,7 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                         <td style={{ padding: '0.45rem 0.5rem', textAlign: 'center', border: 'none' }}></td>
                                         <td style={{ padding: '0.45rem 0.5rem', textAlign: 'center', border: 'none', fontSize: '0.75rem', color: '#94a3b8' }}>—</td>
                                         {[['code','Code',80],['name','Name *',130],['delivery','Delivery',90],['km','Km',60],['latitude','Lat',90],['longitude','Lng',90]].map(([field, ph, w]) => (
-                                            <td key={field} style={{ padding: '0.3rem 0.4rem', border: 'none' }}>
+                                            <td key={field} style={{ padding: '0.3rem 0.4rem', border: 'none', position: 'relative' }}>
                                                 {field === 'delivery' ? (
                                                     <select
                                                         value={addingRow[field]}
@@ -1609,9 +1942,41 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                                         <option value="Alt 1">Alt 1</option>
                                                         <option value="Alt 2">Alt 2</option>
                                                     </select>
+                                                ) : field === 'code' ? (
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                                                        <input
+                                                            autoFocus
+                                                            value={addingRow.code}
+                                                            onChange={e => {
+                                                                const cleaned = e.target.value.replace(/\D/g, '').slice(0, 4);
+                                                                setAddingRow(prev => ({ ...prev, code: cleaned }));
+                                                            }}
+                                                            placeholder="Code"
+                                                            inputMode="numeric"
+                                                            maxLength={4}
+                                                            style={{
+                                                                width: `${w}px`, padding: '0.3rem 0.5rem', borderRadius: '6px',
+                                                                border: `1.5px solid ${addRowCodeConflict ? '#f87171' : '#06b6d466'}`,
+                                                                fontSize: '0.78rem', fontWeight: 600,
+                                                                color: darkMode ? '#f1f5f9' : '#1e293b',
+                                                                background: addRowCodeConflict ? (darkMode ? '#350a0a' : '#fff5f5') : (darkMode ? '#1e293b' : '#fff'),
+                                                                outline: 'none', boxSizing: 'border-box',
+                                                                transition: 'border-color 0.15s, background 0.15s',
+                                                            }}
+                                                        />
+                                                        {addRowCodeConflict && (
+                                                            <span style={{
+                                                                fontSize: '0.62rem', color: '#f87171', fontWeight: 600,
+                                                                whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                                                                maxWidth: '120px', display: 'block',
+                                                            }} title={addRowCodeConflict}>
+                                                                <i className="pi pi-exclamation-circle" style={{ fontSize: '0.6rem', marginRight: '2px' }} />
+                                                                {addRowCodeConflict}
+                                                            </span>
+                                                        )}
+                                                    </div>
                                                 ) : (
                                                     <input
-                                                        autoFocus={field === 'code'}
                                                         value={addingRow[field]}
                                                         onChange={e => setAddingRow(prev => ({ ...prev, [field]: e.target.value }))}
                                                         placeholder={ph}
@@ -1629,8 +1994,17 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                         ))}
                                         <td style={{ padding: '0.45rem 0.5rem', textAlign: 'center', border: 'none' }}>
                                             <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
-                                                <button onClick={handleAddRow}
-                                                    style={{ background: '#06b6d4', border: 'none', borderRadius: '6px', color: '#fff', cursor: 'pointer', padding: '0.25rem 0.55rem', fontSize: '0.75rem', fontWeight: 700 }}
+                                                <button
+                                                    onClick={handleAddRow}
+                                                    disabled={!!addRowCodeConflict || !addingRow.name.trim()}
+                                                    style={{
+                                                        background: (addRowCodeConflict || !addingRow.name.trim()) ? (darkMode ? '#334155' : '#e2e8f0') : '#06b6d4',
+                                                        border: 'none', borderRadius: '6px',
+                                                        color: (addRowCodeConflict || !addingRow.name.trim()) ? (darkMode ? '#475569' : '#94a3b8') : '#fff',
+                                                        cursor: (addRowCodeConflict || !addingRow.name.trim()) ? 'not-allowed' : 'pointer',
+                                                        padding: '0.25rem 0.55rem', fontSize: '0.75rem', fontWeight: 700,
+                                                        transition: 'all 0.15s',
+                                                    }}
                                                 ><i className="pi pi-check" /></button>
                                                 <button onClick={() => setAddingRow(null)}
                                                     style={{ background: 'transparent', border: '1px solid #cbd5e1', borderRadius: '6px', color: '#94a3b8', cursor: 'pointer', padding: '0.25rem 0.5rem', fontSize: '0.75rem' }}
@@ -1661,6 +2035,284 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                     </div>
                 )}
             </Dialog>
+
+            {/* ── Settings Dialog ── */}
+            {(() => {
+                const sBg    = darkMode ? '#0f172a' : '#fafbff';
+                const sBdr   = darkMode ? 'rgba(255,255,255,0.09)' : '#e8edf5';
+                const sTxt   = darkMode ? '#f1f5f9' : '#1e293b';
+                const sSub   = darkMode ? '#64748b' : '#94a3b8';
+                const sHovBg = darkMode ? 'rgba(255,255,255,0.05)' : '#f0f4ff';
+                const sCard  = darkMode ? '#1e293b' : '#ffffff';
+                const COL_META = { no: { label: 'No', icon: 'pi-hashtag' }, code: { label: 'Code', icon: 'pi-tag' }, name: { label: 'Name', icon: 'pi-map-marker' }, delivery: { label: 'Delivery', icon: 'pi-truck' }, km: { label: 'Distance (Km)', icon: 'pi-sort-alt' }, latitude: { label: 'Latitude', icon: 'pi-compass' }, longitude: { label: 'Longitude', icon: 'pi-compass' } };
+                const moveCol = (idx, dir) => setColOrder(prev => { const a = [...prev]; const b = idx + dir; if (b < 0 || b >= a.length) return a; [a[idx], a[b]] = [a[b], a[idx]]; return a; });
+                const saveRowCustomize = () => {
+                    const entries = tableRows.map(r => ({ ...r, _order: parseInt(rowNums[r.code] ?? '') || Infinity })).sort((a, b) => a._order - b._order);
+                    setSavedSortList(entries.map(({ _order, ...r }) => r));
+                    setRowNums({});
+                    setSettingsPage('sorting');
+                    onToast?.('Sort list saved ✓');
+                };
+                const applySort = () => {
+                    if (!savedSortList.length) return;
+                    const codeOrder = savedSortList.map(r => r.code);
+                    setTableRows(prev => {
+                        const sorted = [...prev].sort((a, b) => {
+                            const ai = codeOrder.indexOf(String(a.code)), bi = codeOrder.indexOf(String(b.code));
+                            return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+                        });
+                        return sorted.map((r, i) => ({ ...r, no: i + 1 }));
+                    });
+                    onDirty?.();
+                    onToast?.('Sorting applied ✓');
+                    setSettingsVisible(false);
+                };
+                const PAGES = ['menu', 'columns', 'rows', 'sorting'];
+                const slideIdx = PAGES.indexOf(settingsPage);
+                const btnBack = (label = 'Back') => (
+                    <button onClick={() => setSettingsPage('menu')} style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', padding: '0.4rem 1rem', borderRadius: '8px', border: `1px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}>
+                        <i className="pi pi-arrow-left" style={{ fontSize: '0.68rem' }} />{label}
+                    </button>
+                );
+                return (
+                    <Dialog
+                        visible={settingsVisible}
+                        style={{ width: '460px', borderRadius: '20px', overflow: 'hidden' }}
+                        modal closable={false} header={null} footer={null}
+                        onHide={() => setSettingsVisible(false)}
+                        maskStyle={{ backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)', background: 'rgba(0,0,0,0.4)' }}
+                        contentStyle={{ padding: 0, background: sBg, borderRadius: '20px', overflow: 'hidden' }}
+                    >
+                        <div style={{ borderRadius: '20px', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+
+                            {/* ── Dynamic Header ── */}
+                            <div style={{ padding: '1.1rem 1.4rem', borderBottom: `1px solid ${sBdr}`, background: sCard, display: 'flex', alignItems: 'center', gap: '0.85rem', flexShrink: 0 }}>
+                                {settingsPage === 'menu' ? (
+                                    <>
+                                        <div style={{ width: '40px', height: '40px', borderRadius: '12px', background: `linear-gradient(135deg, ${markerColor}, ${markerColor}99)`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: `0 4px 12px ${markerColor}44` }}>
+                                            <i className="pi pi-cog" style={{ color: '#fff', fontSize: '1rem' }} />
+                                        </div>
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontWeight: 800, fontSize: '1rem', color: sTxt, letterSpacing: '-0.01em' }}>Table Settings</div>
+                                            <div style={{ fontSize: '0.72rem', color: sSub, marginTop: '1px' }}>Customise columns &amp; row order</div>
+                                        </div>
+                                        <button onClick={() => setSettingsVisible(false)} style={{ width: '32px', height: '32px', background: darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9', border: 'none', cursor: 'pointer', color: sSub, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.12)' : '#e2e8f0'; e.currentTarget.style.color = sTxt; }}
+                                            onMouseLeave={e => { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'; e.currentTarget.style.color = sSub; }}>
+                                            <i className="pi pi-times" style={{ fontSize: '0.8rem' }} />
+                                        </button>
+                                    </>
+                                ) : (
+                                    <>
+                                        <button onClick={() => setSettingsPage('menu')} style={{ width: '36px', height: '36px', borderRadius: '50%', border: 'none', background: `${markerColor}18`, color: markerColor, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all 0.15s' }}
+                                            onMouseEnter={e => e.currentTarget.style.background = `${markerColor}2e`}
+                                            onMouseLeave={e => e.currentTarget.style.background = `${markerColor}18`}>
+                                            <i className="pi pi-chevron-left" style={{ fontSize: '0.78rem' }} />
+                                        </button>
+                                        <div style={{ flex: 1 }}>
+                                            <div style={{ fontWeight: 800, fontSize: '1rem', color: sTxt, letterSpacing: '-0.01em' }}>
+                                                {settingsPage === 'columns' ? 'Column Customize' : settingsPage === 'rows' ? 'Row Customize' : 'Sorting List'}
+                                            </div>
+                                            <div style={{ fontSize: '0.72rem', color: sSub, marginTop: '1px' }}>
+                                                {settingsPage === 'columns' ? 'Toggle visibility & reorder columns' : settingsPage === 'rows' ? 'Set sort order for each row' : 'Apply saved sort order to table'}
+                                            </div>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+
+                            {/* ── Sliding panels ── */}
+                            <div style={{ overflow: 'hidden' }}>
+                                <div style={{ display: 'flex', width: `${PAGES.length * 100}%`, transition: 'transform 0.32s cubic-bezier(0.4,0,0.2,1)', transform: `translateX(-${slideIdx * (100 / PAGES.length)}%)` }}>
+
+                                    {/* ── PANEL 0: Main menu ── */}
+                                    <div style={{ width: `${100 / PAGES.length}%`, flexShrink: 0 }}>
+                                        <div style={{ padding: '1.1rem 1.25rem', display: 'flex', flexDirection: 'column', gap: '0.55rem' }}>
+                                            {[
+                                                { key: 'columns', icon: 'pi-table',    iconColor: markerColor, grad: `${markerColor}, ${markerColor}99`, label: 'Column Customize', desc: 'Toggle visibility & reorder columns' },
+                                                { key: 'rows',    icon: 'pi-list',     iconColor: '#10b981',   grad: '#10b981, #059669',                 label: 'Row Customize',    desc: 'Set sort order number for each row' },
+                                                { key: 'sorting', icon: 'pi-sort-alt', iconColor: '#f59e0b',   grad: '#f59e0b, #d97706',                 label: 'Sorting List',     desc: 'View & apply saved row sort order' },
+                                            ].map(item => (
+                                                <button key={item.key} onClick={() => setSettingsPage(item.key)}
+                                                    style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem 1.1rem', borderRadius: '14px', border: `1.5px solid ${sBdr}`, background: sCard, cursor: 'pointer', textAlign: 'left', width: '100%', transition: 'all 0.18s', boxShadow: darkMode ? 'none' : '0 1px 4px rgba(0,0,0,0.04)' }}
+                                                    onMouseEnter={e => { e.currentTarget.style.borderColor = item.iconColor + '55'; e.currentTarget.style.background = item.iconColor + '08'; e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = `0 4px 16px ${item.iconColor}22`; }}
+                                                    onMouseLeave={e => { e.currentTarget.style.borderColor = sBdr; e.currentTarget.style.background = sCard; e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = darkMode ? 'none' : '0 1px 4px rgba(0,0,0,0.04)'; }}
+                                                >
+                                                    <div style={{ width: '44px', height: '44px', borderRadius: '13px', background: `linear-gradient(135deg, ${item.grad})`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, boxShadow: `0 3px 10px ${item.iconColor}44` }}>
+                                                        <i className={`pi ${item.icon}`} style={{ fontSize: '1rem', color: '#fff' }} />
+                                                    </div>
+                                                    <div style={{ flex: 1 }}>
+                                                        <div style={{ fontSize: '0.88rem', fontWeight: 700, color: sTxt, letterSpacing: '-0.01em' }}>{item.label}</div>
+                                                        <div style={{ fontSize: '0.73rem', color: sSub, marginTop: '2px' }}>{item.desc}</div>
+                                                    </div>
+                                                    <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: darkMode ? 'rgba(255,255,255,0.05)' : '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                                                        <i className="pi pi-chevron-right" style={{ fontSize: '0.62rem', color: sSub }} />
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* ── PANEL 1: Column Customize ── */}
+                                    <div style={{ width: `${100 / PAGES.length}%`, flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
+                                        <div style={{ overflowY: 'auto', maxHeight: '380px', padding: '1rem 1.25rem', display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                                            {colOrder.map((key, idx) => (
+                                                <div key={key} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', padding: '0.7rem 0.9rem', borderRadius: '12px', border: `1.5px solid ${visibleCols[key] ? markerColor + '50' : sBdr}`, background: visibleCols[key] ? (darkMode ? markerColor + '14' : markerColor + '08') : sCard, transition: 'all 0.18s', boxShadow: visibleCols[key] ? `0 2px 10px ${markerColor}18` : 'none' }}>
+                                                    <div onClick={() => setVisibleCols(prev => ({ ...prev, [key]: !prev[key] }))} style={{ width: '20px', height: '20px', borderRadius: '6px', border: `2px solid ${visibleCols[key] ? markerColor : sBdr}`, background: visibleCols[key] ? markerColor : 'transparent', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all 0.18s' }}>
+                                                        {visibleCols[key] && <i className="pi pi-check" style={{ fontSize: '0.58rem', color: '#fff' }} />}
+                                                    </div>
+                                                    <div style={{ width: '28px', height: '28px', borderRadius: '8px', background: visibleCols[key] ? `${markerColor}18` : (darkMode ? 'rgba(255,255,255,0.05)' : '#f1f5f9'), display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, transition: 'all 0.18s' }}>
+                                                        <i className={`pi ${COL_META[key].icon}`} style={{ fontSize: '0.72rem', color: visibleCols[key] ? markerColor : sSub, transition: 'color 0.18s' }} />
+                                                    </div>
+                                                    <span style={{ flex: 1, fontSize: '0.85rem', fontWeight: 600, color: visibleCols[key] ? sTxt : sSub, transition: 'color 0.18s' }}>{COL_META[key].label}</span>
+                                                    <div style={{ display: 'flex', gap: '3px' }}>
+                                                        {[[-1,'pi-chevron-up',idx === 0],[1,'pi-chevron-down',idx === colOrder.length - 1]].map(([dir, icon, disabled]) => (
+                                                            <button key={icon} onClick={() => moveCol(idx, dir)} disabled={disabled} style={{ width: '26px', height: '26px', borderRadius: '7px', border: `1px solid ${sBdr}`, background: disabled ? 'transparent' : (darkMode ? 'rgba(255,255,255,0.05)' : '#f8fafc'), cursor: disabled ? 'default' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: disabled ? sBdr : sSub, padding: 0, opacity: disabled ? 0.35 : 1, transition: 'all 0.15s' }}
+                                                                onMouseEnter={e => { if (!disabled) { e.currentTarget.style.background = `${markerColor}18`; e.currentTarget.style.borderColor = `${markerColor}44`; e.currentTarget.style.color = markerColor; } }}
+                                                                onMouseLeave={e => { if (!disabled) { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.05)' : '#f8fafc'; e.currentTarget.style.borderColor = sBdr; e.currentTarget.style.color = sSub; } }}>
+                                                                <i className={`pi ${icon}`} style={{ fontSize: '0.55rem' }} />
+                                                            </button>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* ── PANEL 2: Row Customize ── */}
+                                    <div style={{ width: `${100 / PAGES.length}%`, flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
+                                        <div style={{ overflowY: 'auto', maxHeight: '380px' }}>
+                                            <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                                                <thead>
+                                                    <tr style={{ background: darkMode ? 'rgba(255,255,255,0.04)' : '#f0f4ff', position: 'sticky', top: 0, zIndex: 2 }}>
+                                                        {[['Order','center','56px'],['Code','left',''],['Name','left',''],['Km','left','']].map(([h, align, w]) => (
+                                                            <th key={h} style={{ padding: '0.6rem 0.8rem', textAlign: align, fontSize: '0.68rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: sSub, borderBottom: `2px solid ${sBdr}`, whiteSpace: 'nowrap', ...(w ? { width: w } : {}) }}>{h}</th>
+                                                        ))}
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {tableRows.map((row, ri) => (
+                                                        <tr key={row.code} style={{ borderBottom: `1px solid ${sBdr}`, background: ri % 2 !== 0 ? (darkMode ? 'rgba(255,255,255,0.018)' : 'rgba(240,244,255,0.5)') : 'transparent', transition: 'background 0.15s' }}>
+                                                            <td style={{ padding: '0.5rem 0.6rem', textAlign: 'center', width: '56px' }}>
+                                                                <input type="number" min="1" value={rowNums[row.code] || ''} onChange={e => setRowNums(prev => ({ ...prev, [row.code]: e.target.value }))} placeholder="–"
+                                                                    style={{ width: '44px', padding: '0.32rem 0.4rem', borderRadius: '8px', textAlign: 'center', border: `1.5px solid ${rowNums[row.code] ? '#10b981' : sBdr}`, background: rowNums[row.code] ? (darkMode ? 'rgba(16,185,129,0.1)' : 'rgba(16,185,129,0.06)') : (darkMode ? '#0f172a' : '#fff'), color: sTxt, fontSize: '0.8rem', outline: 'none', fontFamily: 'inherit', transition: 'all 0.15s', boxShadow: rowNums[row.code] ? '0 0 0 3px rgba(16,185,129,0.15)' : 'none' }} />
+                                                            </td>
+                                                            <td style={{ padding: '0.5rem 0.6rem' }}>
+                                                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '6px', padding: '2px 8px', fontSize: '0.75rem', fontWeight: 800, color: '#10b981' }}>{row.code}</span>
+                                                            </td>
+                                                            <td style={{ padding: '0.5rem 0.6rem', color: sTxt, fontSize: '0.8rem', maxWidth: '130px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: 500 }}>{row.name}</td>
+                                                            <td style={{ padding: '0.5rem 0.8rem 0.5rem 0.5rem', color: sSub, fontSize: '0.75rem', whiteSpace: 'nowrap' }}>{row.km} km</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+
+                                    {/* ── PANEL 3: Sorting List ── */}
+                                    <div style={{ width: `${100 / PAGES.length}%`, flexShrink: 0, display: 'flex', flexDirection: 'column' }}>
+                                        <div style={{ overflowY: 'auto', maxHeight: '380px', padding: '1rem 1.25rem' }}>
+                                            {savedSortList.length === 0 ? (
+                                                <div style={{ textAlign: 'center', padding: '3rem 1rem', color: sSub }}>
+                                                    <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: darkMode ? 'rgba(255,255,255,0.05)' : '#f1f5f9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1rem' }}>
+                                                        <i className="pi pi-inbox" style={{ fontSize: '1.6rem', opacity: 0.35 }} />
+                                                    </div>
+                                                    <div style={{ fontSize: '0.88rem', fontWeight: 700, color: sTxt }}>No sorting list saved yet.</div>
+                                                    <div style={{ fontSize: '0.75rem', marginTop: '6px', opacity: 0.6 }}>Go to Row Customize to create one.</div>
+                                                    <button onClick={() => setSettingsPage('rows')} style={{ marginTop: '1rem', padding: '0.45rem 1.2rem', borderRadius: '10px', border: 'none', background: 'linear-gradient(135deg,#f59e0b,#d97706)', color: '#fff', fontSize: '0.8rem', fontWeight: 700, cursor: 'pointer', boxShadow: '0 4px 12px rgba(245,158,11,0.35)' }}>
+                                                        Go to Row Customize
+                                                    </button>
+                                                </div>
+                                            ) : (
+                                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem' }}>
+                                                    {savedSortList.map((row, i) => (
+                                                        <div key={row.code} style={{ display: 'flex', alignItems: 'center', gap: '0.85rem', padding: '0.75rem 1rem', borderRadius: '13px', border: `1.5px solid ${sBdr}`, background: sCard, boxShadow: darkMode ? 'none' : '0 1px 4px rgba(0,0,0,0.04)', transition: 'all 0.15s' }}>
+                                                            <div style={{ width: '34px', height: '34px', borderRadius: '50%', background: 'linear-gradient(135deg,#f59e0b,#d97706)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.78rem', fontWeight: 800, color: '#fff', flexShrink: 0, boxShadow: '0 3px 8px rgba(245,158,11,0.4)' }}>{i + 1}</div>
+                                                            <div style={{ flex: 1, minWidth: 0 }}>
+                                                                <div style={{ fontSize: '0.84rem', fontWeight: 700, color: sTxt, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{row.name}</div>
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '3px' }}>
+                                                                    <span style={{ background: 'rgba(16,185,129,0.12)', border: '1px solid rgba(16,185,129,0.28)', borderRadius: '5px', padding: '1px 7px', fontSize: '0.68rem', fontWeight: 800, color: '#10b981' }}>{row.code}</span>
+                                                                    <span style={{ fontSize: '0.7rem', color: sSub }}>{row.km} km</span>
+                                                                </div>
+                                                            </div>
+                                                            <div style={{ width: '26px', height: '26px', borderRadius: '50%', background: 'rgba(245,158,11,0.12)', border: '1px solid rgba(245,158,11,0.28)', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                                                                <i className="pi pi-sort-alt" style={{ fontSize: '0.6rem', color: '#f59e0b' }} />
+                                                            </div>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                </div>
+                            </div>
+
+                            {/* ── Unified Footer ── */}
+                            <div style={{ padding: '0.85rem 1.25rem', borderTop: `1px solid ${sBdr}`, display: 'flex', alignItems: 'center', background: sCard, flexShrink: 0, minHeight: '56px' }}>
+                                {settingsPage === 'menu' && (
+                                    <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
+                                        <button onClick={() => setSettingsVisible(false)} style={{ padding: '0.45rem 1.3rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.82rem', fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'; }}
+                                            onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}>Close</button>
+                                    </div>
+                                )}
+                                {settingsPage === 'columns' && (
+                                    <>
+                                        <button onClick={() => { setVisibleCols({ no: true, code: true, name: true, delivery: true, km: true, latitude: true, longitude: true }); setColOrder(['no','code','name','delivery','km','latitude','longitude']); }} style={{ fontSize: '0.78rem', fontWeight: 700, color: markerColor, background: `${markerColor}15`, border: `1px solid ${markerColor}33`, cursor: 'pointer', padding: '0.38rem 0.9rem', borderRadius: '8px', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => e.currentTarget.style.background = `${markerColor}25`}
+                                            onMouseLeave={e => e.currentTarget.style.background = `${markerColor}15`}>Reset All</button>
+                                        <div style={{ flex: 1 }} />
+                                        <button onClick={() => setSettingsPage('menu')} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.42rem 1.1rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.82rem', fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                                            <i className="pi pi-arrow-left" style={{ fontSize: '0.68rem' }} />Back
+                                        </button>
+                                    </>
+                                )}
+                                {settingsPage === 'rows' && (
+                                    <>
+                                        <button onClick={() => setSettingsPage('menu')} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.42rem 1.1rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.82rem', fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                                            <i className="pi pi-arrow-left" style={{ fontSize: '0.68rem' }} />Back
+                                        </button>
+                                        <div style={{ flex: 1 }} />
+                                        <div style={{ display: 'flex', gap: '0.45rem' }}>
+                                            <button onClick={() => setRowNums({})} style={{ padding: '0.42rem 0.95rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' }}
+                                                onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>Clear</button>
+                                            <button onClick={saveRowCustomize} disabled={!Object.values(rowNums).some(v => v)} style={{ padding: '0.42rem 1.2rem', borderRadius: '10px', border: 'none', background: Object.values(rowNums).some(v => v) ? 'linear-gradient(135deg,#10b981,#059669)' : sBdr, color: Object.values(rowNums).some(v => v) ? '#fff' : sSub, fontSize: '0.82rem', fontWeight: 700, cursor: Object.values(rowNums).some(v => v) ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: '0.35rem', transition: 'all 0.15s', boxShadow: Object.values(rowNums).some(v => v) ? '0 4px 12px rgba(16,185,129,0.35)' : 'none' }}>
+                                                <i className="pi pi-save" style={{ fontSize: '0.72rem' }} />Save
+                                            </button>
+                                        </div>
+                                    </>
+                                )}
+                                {settingsPage === 'sorting' && (
+                                    <>
+                                        <button onClick={() => setSettingsPage('menu')} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.42rem 1.1rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.82rem', fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s' }}
+                                            onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                                            <i className="pi pi-arrow-left" style={{ fontSize: '0.68rem' }} />Back
+                                        </button>
+                                        <div style={{ flex: 1 }} />
+                                        <div style={{ display: 'flex', gap: '0.45rem' }}>
+                                            <button onClick={() => setSettingsPage('rows')} style={{ padding: '0.42rem 0.95rem', borderRadius: '10px', border: `1.5px solid ${sBdr}`, background: 'transparent', color: sSub, fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '0.35rem', transition: 'all 0.15s' }}
+                                                onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.06)' : '#f1f5f9'}
+                                                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                                                <i className="pi pi-pencil" style={{ fontSize: '0.7rem' }} />Edit
+                                            </button>
+                                            <button onClick={applySort} disabled={savedSortList.length === 0} style={{ padding: '0.42rem 1.2rem', borderRadius: '10px', border: 'none', background: savedSortList.length ? `linear-gradient(135deg, ${markerColor}, ${markerColor}cc)` : sBdr, color: savedSortList.length ? '#fff' : sSub, fontSize: '0.82rem', fontWeight: 700, cursor: savedSortList.length ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: '0.35rem', transition: 'all 0.15s', boxShadow: savedSortList.length ? `0 4px 12px ${markerColor}44` : 'none' }}>
+                                                <i className="pi pi-check" style={{ fontSize: '0.72rem' }} />Apply
+                                            </button>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </Dialog>
+                );
+            })()}
 
             {/* ── Delivery Modal ── */}
             {(() => {
@@ -1836,6 +2488,37 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                             >{opt}</button>
                                         ))}
                                     </div>
+                                ) : editingCell.field === 'code' ? (
+                                    <>
+                                    <input
+                                        type="text"
+                                        inputMode="numeric"
+                                        value={editingCell.value}
+                                        onChange={e => {
+                                            const raw = e.target.value.replace(/\D/g, '').slice(0, 4);
+                                            setEditingCell(prev => ({ ...prev, value: raw }));
+                                        }}
+                                        placeholder="Enter up to 4 digits…"
+                                        autoFocus
+                                        maxLength={4}
+                                        style={{
+                                            width: '100%', padding: '0.5rem 0.75rem', borderRadius: '8px',
+                                            border: `1.5px solid ${codeConflict ? '#ef4444' : cellDirty ? markerColor : `${markerColor}55`}`,
+                                            fontSize: '0.84rem', fontWeight: 600,
+                                            color: darkMode ? '#f1f5f9' : '#1e293b',
+                                            background: darkMode ? '#1e293b' : '#f8fafc',
+                                            outline: 'none', boxSizing: 'border-box', transition: 'border-color 0.15s',
+                                            letterSpacing: '0.12em',
+                                        }}
+                                        onKeyDown={e => { if (e.key === 'Enter' && !codeConflict) handleCellSave(); }}
+                                    />
+                                    {codeConflict && (
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.72rem', color: '#ef4444', fontWeight: 600, marginTop: '-0.15rem' }}>
+                                            <i className="pi pi-exclamation-circle" style={{ fontSize: '0.7rem' }} />
+                                            {codeConflict}
+                                        </div>
+                                    )}
+                                    </>
                                 ) : (
                                     <input
                                         type={meta.type === 'number' ? 'number' : 'text'}
@@ -1857,23 +2540,327 @@ function CardItem({ title, subTitle, description, tags, date, darkMode, editMode
                                 )}
                                 <button
                                     onClick={handleCellSave}
+                                    onMouseEnter={e => { if (cellDirty && !codeConflict) e.currentTarget.style.opacity = '0.85'; }}
+                                    onMouseLeave={e => { e.currentTarget.style.opacity = '1'; }}
+                                    disabled={!cellDirty || !!codeConflict}
                                     style={{
                                         display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem',
-                                        background: markerColor, color: '#fff', border: 'none',
-                                        borderRadius: '8px', padding: '0.5rem 0',
-                                        fontSize: '0.78rem', fontWeight: 700, cursor: 'pointer',
-                                        letterSpacing: '0.02em', transition: 'opacity 0.15s',
+                                        background: (cellDirty && !codeConflict) ? markerColor : (darkMode ? '#334155' : '#e2e8f0'),
+                                        color: (cellDirty && !codeConflict) ? '#fff' : (darkMode ? '#475569' : '#94a3b8'),
+                                        border: 'none', borderRadius: '8px', padding: '0.5rem 0',
+                                        fontSize: '0.78rem', fontWeight: 700,
+                                        cursor: (cellDirty && !codeConflict) ? 'pointer' : 'not-allowed',
+                                        letterSpacing: '0.02em', transition: 'all 0.2s',
                                     }}
-                                    onMouseEnter={e => e.currentTarget.style.opacity = '0.85'}
-                                    onMouseLeave={e => e.currentTarget.style.opacity = '1'}
                                 >
-                                    <i className="pi pi-check" style={{ fontSize: '0.72rem' }} /> Save
+                                    <i className="pi pi-check" style={{ fontSize: '0.72rem' }} /> Change
                                 </button>
                             </div>
                         </>
                     );
                 })()}
             </OverlayPanel>
+
+            {/* ── Action Modal ─────────────────────────────────────────── */}
+            <Dialog
+                visible={showActionModal}
+                onHide={() => setShowActionModal(false)}
+                showHeader={false}
+                modal
+                style={{ width: '340px', borderRadius: '16px', overflow: 'hidden', boxShadow: darkMode ? '0 25px 60px rgba(0,0,0,0.6)' : '0 25px 60px rgba(0,0,0,0.18)' }}
+                contentStyle={{ padding: 0, background: darkMode ? '#0f172a' : '#fff', borderRadius: '16px', height: '520px', overflow: 'hidden' }}
+                maskStyle={{ backdropFilter: 'blur(4px)', WebkitBackdropFilter: 'blur(4px)', background: 'rgba(0,0,0,0.3)' }}
+            >
+                {/* ── 3-panel slider ── */}
+                <div style={{
+                    display: 'flex', width: '300%', height: '100%',
+                    transform: `translateX(${actionStep === 'menu' ? 0 : actionStep === 'move' ? -100/3 : -200/3}%)`,
+                    transition: 'transform 0.32s cubic-bezier(0.4,0,0.2,1)',
+                }}>
+                {/* ── PANEL 0: menu ── */}
+                <div style={{ width: '33.333%', flexShrink: 0, height: '100%', overflowY: 'auto' }}>
+                {true && (
+                    <div>
+                        {/* Header band */}
+                        <div style={{
+                            background: `linear-gradient(135deg, ${markerColor}ee 0%, ${markerColor}99 100%)`,
+                            padding: '1.5rem 1.5rem 1.25rem',
+                            position: 'relative',
+                        }}>
+                            <button onClick={() => setShowActionModal(false)} style={{
+                                position: 'absolute', top: '1rem', right: '1rem',
+                                background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%',
+                                width: '28px', height: '28px', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
+                            }}>
+                                <i className="pi pi-times" style={{ fontSize: '0.7rem' }} />
+                            </button>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                <div style={{
+                                    width: '40px', height: '40px', borderRadius: '12px',
+                                    background: 'rgba(255,255,255,0.25)', backdropFilter: 'blur(8px)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}>
+                                    <i className="pi pi-bolt" style={{ fontSize: '1.1rem', color: '#fff' }} />
+                                </div>
+                                <div>
+                                    <div style={{ color: '#fff', fontWeight: 800, fontSize: '1rem', lineHeight: 1.2 }}>Bulk Actions</div>
+                                    <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: '0.75rem', marginTop: '2px' }}>
+                                        {selectedRows.length} row{selectedRows.length !== 1 ? 's' : ''} selected
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Action cards */}
+                        <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                            <button
+                                onClick={() => { setSelectedTargetCard(''); setActionStep('move'); }}
+                                style={{
+                                    display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem 1.1rem',
+                                    borderRadius: '12px', border: `1.5px solid ${markerColor}33`,
+                                    background: darkMode ? `${markerColor}12` : `${markerColor}08`,
+                                    cursor: 'pointer', textAlign: 'left', width: '100%', transition: 'all 0.15s',
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.background = darkMode ? `${markerColor}22` : `${markerColor}14`; e.currentTarget.style.borderColor = `${markerColor}66`; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                                onMouseLeave={e => { e.currentTarget.style.background = darkMode ? `${markerColor}12` : `${markerColor}08`; e.currentTarget.style.borderColor = `${markerColor}33`; e.currentTarget.style.transform = 'none'; }}
+                            >
+                                <div style={{
+                                    width: '42px', height: '42px', borderRadius: '11px', flexShrink: 0,
+                                    background: `linear-gradient(135deg, ${markerColor}cc, ${markerColor}88)`,
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    boxShadow: `0 4px 12px ${markerColor}44`,
+                                }}>
+                                    <i className="pi pi-arrow-right-arrow-left" style={{ fontSize: '1rem', color: '#fff' }} />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontWeight: 700, fontSize: '0.9rem', color: darkMode ? '#f1f5f9' : '#1e293b', marginBottom: '2px' }}>Move Rows</div>
+                                    <div style={{ fontSize: '0.74rem', color: darkMode ? '#64748b' : '#94a3b8' }}>Transfer selected rows to another route</div>
+                                </div>
+                                <i className="pi pi-chevron-right" style={{ fontSize: '0.7rem', color: darkMode ? '#475569' : '#cbd5e1' }} />
+                            </button>
+
+                            <button
+                                onClick={() => setActionStep('delete-confirm')}
+                                style={{
+                                    display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem 1.1rem',
+                                    borderRadius: '12px', border: '1.5px solid rgba(239,68,68,0.2)',
+                                    background: darkMode ? 'rgba(239,68,68,0.08)' : '#fff9f9',
+                                    cursor: 'pointer', textAlign: 'left', width: '100%', transition: 'all 0.15s',
+                                }}
+                                onMouseEnter={e => { e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.15)' : '#fef2f2'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.4)'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                                onMouseLeave={e => { e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.08)' : '#fff9f9'; e.currentTarget.style.borderColor = 'rgba(239,68,68,0.2)'; e.currentTarget.style.transform = 'none'; }}
+                            >
+                                <div style={{
+                                    width: '42px', height: '42px', borderRadius: '11px', flexShrink: 0,
+                                    background: 'linear-gradient(135deg, #ef4444cc, #dc262688)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                    boxShadow: '0 4px 12px rgba(239,68,68,0.35)',
+                                }}>
+                                    <i className="pi pi-trash" style={{ fontSize: '1rem', color: '#fff' }} />
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                    <div style={{ fontWeight: 700, fontSize: '0.9rem', color: darkMode ? '#f1f5f9' : '#1e293b', marginBottom: '2px' }}>Delete Rows</div>
+                                    <div style={{ fontSize: '0.74rem', color: darkMode ? '#64748b' : '#94a3b8' }}>Permanently remove selected rows</div>
+                                </div>
+                                <i className="pi pi-chevron-right" style={{ fontSize: '0.7rem', color: darkMode ? '#475569' : '#cbd5e1' }} />
+                            </button>
+                        </div>
+                    </div>
+                    )}
+                </div>{/* end panel 0 */}
+
+                {/* ── PANEL 1: move ── */}
+                <div style={{ width: '33.333%', flexShrink: 0, height: '100%', overflowY: 'auto' }}>
+                {true && (
+                    <div>
+                        {/* Header */}
+                        <div style={{
+                            background: `linear-gradient(135deg, ${markerColor}ee 0%, ${markerColor}99 100%)`,
+                            padding: '1.5rem 1.5rem 1.25rem', position: 'relative',
+                        }}>
+                            <button onClick={() => setActionStep('menu')} style={{
+                                position: 'absolute', top: '1rem', right: '1rem',
+                                background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%',
+                                width: '28px', height: '28px', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
+                            }}>
+                                <i className="pi pi-arrow-left" style={{ fontSize: '0.7rem' }} />
+                            </button>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                <div style={{
+                                    width: '40px', height: '40px', borderRadius: '12px',
+                                    background: 'rgba(255,255,255,0.25)', backdropFilter: 'blur(8px)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}>
+                                    <i className="pi pi-arrow-right-arrow-left" style={{ fontSize: '1.1rem', color: '#fff' }} />
+                                </div>
+                                <div>
+                                    <div style={{ color: '#fff', fontWeight: 800, fontSize: '1rem', lineHeight: 1.2 }}>Move Rows</div>
+                                    <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: '0.75rem', marginTop: '2px' }}>
+                                        Moving {selectedRows.length} row{selectedRows.length !== 1 ? 's' : ''}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            <div style={{ fontSize: '0.78rem', color: darkMode ? '#94a3b8' : '#64748b', fontWeight: 500 }}>
+                                Select destination route:
+                            </div>
+                            {/* Route option cards */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                {otherCards.map(c => (
+                                    <button key={c.i} onClick={() => setSelectedTargetCard(String(c.i))}
+                                        style={{
+                                            display: 'flex', alignItems: 'center', gap: '0.75rem',
+                                            padding: '0.75rem 1rem', borderRadius: '10px',
+                                            border: selectedTargetCard === String(c.i)
+                                                ? `2px solid ${markerColor}` : `1.5px solid ${darkMode ? 'rgba(255,255,255,0.08)' : '#e2e8f0'}`,
+                                            background: selectedTargetCard === String(c.i)
+                                                ? darkMode ? `${markerColor}22` : `${markerColor}0f`
+                                                : darkMode ? 'rgba(255,255,255,0.03)' : '#f8fafc',
+                                            cursor: 'pointer', textAlign: 'left', width: '100%', transition: 'all 0.15s',
+                                        }}
+                                    >
+                                        <div style={{
+                                            width: '32px', height: '32px', borderRadius: '8px', flexShrink: 0,
+                                            background: selectedTargetCard === String(c.i) ? markerColor : darkMode ? 'rgba(255,255,255,0.07)' : '#e2e8f0',
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.15s',
+                                        }}>
+                                            <i className="pi pi-map-marker" style={{ fontSize: '0.75rem', color: selectedTargetCard === String(c.i) ? '#fff' : darkMode ? '#64748b' : '#94a3b8' }} />
+                                        </div>
+                                        <span style={{ fontWeight: 600, fontSize: '0.86rem', color: darkMode ? '#e2e8f0' : '#1e293b', flex: 1 }}>{c.title}</span>
+                                        {selectedTargetCard === String(c.i) && (
+                                            <i className="pi pi-check-circle" style={{ fontSize: '0.95rem', color: markerColor }} />
+                                        )}
+                                    </button>
+                                ))}
+                            </div>
+
+                            <button
+                                disabled={!selectedTargetCard}
+                                onClick={() => {
+                                    setActionLoading(true);
+                                    const toIdx = parseInt(selectedTargetCard);
+                                    const rowObjs = tableRows.filter(r => selectedRows.includes(r.no));
+                                    const movedNames = rowObjs.map(r => r.name);
+                                    setTimeout(() => {
+                                        if (onMoveRows) onMoveRows(rowObjs, toIdx);
+                                        setTableRows(prev => prev.filter(r => !selectedRows.includes(r.no)));
+                                        setChangelog(prev => [...prev, { date: new Date(), names: movedNames, action: 'moved out' }]);
+                                        setSelectedRows([]);
+                                        setActionLoading(false);
+                                        setShowActionModal(false);
+                                        onDirty?.();
+                                        onToast?.(`${movedNames.length} row${movedNames.length !== 1 ? 's' : ''} moved successfully`);
+                                    }, 700);
+                                }}
+                                style={{
+                                    width: '100%', padding: '0.7rem', borderRadius: '10px', border: 'none',
+                                    background: selectedTargetCard ? `linear-gradient(135deg, ${markerColor}, ${markerColor}bb)` : darkMode ? '#334155' : '#e2e8f0',
+                                    color: selectedTargetCard ? '#fff' : darkMode ? '#475569' : '#94a3b8',
+                                    cursor: selectedTargetCard && !actionLoading ? 'pointer' : 'not-allowed',
+                                    fontWeight: 700, fontSize: '0.86rem', transition: 'all 0.2s',
+                                    boxShadow: selectedTargetCard ? `0 4px 14px ${markerColor}55` : 'none',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem',
+                                    opacity: actionLoading ? 0.75 : 1,
+                                }}
+                            >
+                                {actionLoading
+                                    ? <><span style={{ width: '13px', height: '13px', border: '2px solid rgba(255,255,255,0.35)', borderTopColor: '#fff', borderRadius: '50%', display: 'inline-block', animation: 'rl-spin 0.7s linear infinite' }} /> Moving…</>
+                                    : <><i className="pi pi-send" style={{ fontSize: '0.8rem' }} /> Confirm Move</>}
+                            </button>
+                        </div>
+                    </div>
+                    )}
+                </div>{/* end panel 1 */}
+
+                {/* ── PANEL 2: delete-confirm ── */}
+                <div style={{ width: '33.333%', flexShrink: 0, height: '100%', overflowY: 'auto' }}>
+                {true && (
+                    <div>
+                        {/* Header */}
+                        <div style={{
+                            background: 'linear-gradient(135deg, #ef4444ee 0%, #dc262699 100%)',
+                            padding: '1.5rem 1.5rem 1.25rem', position: 'relative',
+                        }}>
+                            <button onClick={() => setActionStep('menu')} style={{
+                                position: 'absolute', top: '1rem', right: '1rem',
+                                background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%',
+                                width: '28px', height: '28px', cursor: 'pointer',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff',
+                            }}>
+                                <i className="pi pi-arrow-left" style={{ fontSize: '0.7rem' }} />
+                            </button>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                <div style={{
+                                    width: '40px', height: '40px', borderRadius: '12px',
+                                    background: 'rgba(255,255,255,0.25)', backdropFilter: 'blur(8px)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                }}>
+                                    <i className="pi pi-trash" style={{ fontSize: '1.1rem', color: '#fff' }} />
+                                </div>
+                                <div>
+                                    <div style={{ color: '#fff', fontWeight: 800, fontSize: '1rem', lineHeight: 1.2 }}>Delete Rows</div>
+                                    <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: '0.75rem', marginTop: '2px' }}>
+                                        {selectedRows.length} row{selectedRows.length !== 1 ? 's' : ''} will be removed
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                            {/* Warning box */}
+                            <div style={{
+                                display: 'flex', gap: '0.75rem', alignItems: 'flex-start',
+                                padding: '1rem', borderRadius: '10px',
+                                background: darkMode ? 'rgba(239,68,68,0.08)' : '#fff5f5',
+                                border: '1px dashed rgba(239,68,68,0.35)',
+                            }}>
+                                <i className="pi pi-exclamation-circle" style={{ fontSize: '1.15rem', color: '#ef4444', marginTop: '1px', flexShrink: 0 }} />
+                                <div style={{ fontSize: '0.8rem', color: darkMode ? '#fca5a5' : '#991b1b', lineHeight: 1.5 }}>
+                                    <strong>This cannot be undone.</strong> The selected rows will be permanently deleted from this route and cannot be recovered.
+                                </div>
+                            </div>
+
+                            <button
+                                onClick={() => {
+                                    setActionLoading(true);
+                                    const deletedRows = tableRows.filter(r => selectedRows.includes(r.no));
+                                    const deletedNames = deletedRows.map(r => r.name);
+                                    setTimeout(() => {
+                                        setTableRows(prev => prev.filter(r => !selectedRows.includes(r.no)));
+                                        setChangelog(prev => [...prev, { date: new Date(), names: deletedNames, action: 'deleted' }]);
+                                        setSelectedRows([]);
+                                        setActionLoading(false);
+                                        setShowActionModal(false);
+                                        onDirty?.();
+                                        onToast?.(`${deletedNames.length} row${deletedNames.length !== 1 ? 's' : ''} deleted`, 'error');
+                                    }, 700);
+                                }}
+                                style={{
+                                    width: '100%', padding: '0.7rem', borderRadius: '10px', border: 'none',
+                                    background: 'linear-gradient(135deg, #ef4444, #dc2626)',
+                                    color: '#fff', cursor: actionLoading ? 'not-allowed' : 'pointer', fontWeight: 700, fontSize: '0.86rem',
+                                    boxShadow: '0 4px 14px rgba(239,68,68,0.45)',
+                                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem',
+                                    transition: 'opacity 0.15s', opacity: actionLoading ? 0.75 : 1,
+                                }}
+                                onMouseEnter={e => { if (!actionLoading) e.currentTarget.style.opacity = '0.88'; }}
+                                onMouseLeave={e => { if (!actionLoading) e.currentTarget.style.opacity = '1'; }}
+                            >
+                                {actionLoading
+                                    ? <><span style={{ width: '13px', height: '13px', border: '2px solid rgba(255,255,255,0.35)', borderTopColor: '#fff', borderRadius: '50%', display: 'inline-block', animation: 'rl-spin 0.7s linear infinite' }} /> Deleting…</>
+                                    : <><i className="pi pi-trash" style={{ fontSize: '0.8rem' }} /> Yes, Delete {selectedRows.length} Row{selectedRows.length !== 1 ? 's' : ''}</>}
+                            </button>
+                        </div>
+                    </div>
+                    )}
+                </div>{/* end panel 2 */}
+                </div>{/* end slider */}
+            </Dialog>
+
         </div>
     );
 }
@@ -2167,19 +3154,196 @@ function AddRouteCard({ darkMode, onAdd }) {
 }
 
 // ── Export ───────────────────────────────────────────────────────────────────
-export default function AdvancedDemo({ darkMode, editMode }) {
+export default function AdvancedDemo({ darkMode, editMode, onResumeEditMode, onHasChanges, exitPending, onExitDecision, onCardsChange }) {
     const [cards, setCards] = useState(cardDatasets);
+    const [rowOps, setRowOps] = useState({});
+    const [toasts, setToasts] = useState([]);
+    const [editSnapshot, setEditSnapshot] = useState(null);
+    const [cardKeys, setCardKeys] = useState(() => cardDatasets.map(() => 0));
+    const [hasChanges, setHasChanges] = useState(false);
+
+    // Expose cards data to parent (for All Locations page)
+    useEffect(() => { onCardsChange?.(cards); }, [cards]);
+
+    const showToast = (message, type = 'success') => {
+        const id = Date.now();
+        setToasts(prev => [...prev, { id, message, type }]);
+        setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3200);
+    };
+
+    // Snapshot cards when entering edit mode
+    useEffect(() => {
+        if (editMode && !editSnapshot) {
+            setEditSnapshot(JSON.parse(JSON.stringify(cards)));
+        }
+        if (!editMode) {
+            setEditSnapshot(null);
+            setHasChanges(false);
+            onHasChanges?.(false);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [editMode]);
+
+    const markDirty = () => {
+        setHasChanges(true);
+        onHasChanges?.(true);
+    };
+
+    const handleSaveAll = () => {
+        setEditSnapshot(null);
+        setHasChanges(false);
+        onHasChanges?.(false);
+        showToast('All changes saved');
+    };
+
+    const handleDiscardAll = () => {
+        if (editSnapshot) setCards(JSON.parse(JSON.stringify(editSnapshot)));
+        setRowOps({});
+        setCardKeys(prev => prev.map(k => k + 1));
+        setEditSnapshot(null);
+        setHasChanges(false);
+        onHasChanges?.(false);
+        showToast('Changes discarded', 'warn');
+    };
 
     const handleAddCard = (newCard) => {
         setCards(prev => [...prev, newCard]);
     };
 
+    const handleDeleteCard = (index) => {
+        setCards(prev => prev.filter((_, j) => j !== index));
+        setCardKeys(prev => prev.filter((_, j) => j !== index));
+        markDirty();
+        showToast('Route deleted', 'warn');
+    };
+
+    const handleMoveRows = (fromIndex, rowObjects, toIndex) => {
+        setRowOps(prev => ({ ...prev, [toIndex]: { type: 'add', rows: rowObjects, id: Date.now() } }));
+    };
+
     return (
+        <>
         <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'stretch' }}>
             {cards.map((card, i) => (
-                <CardItem key={i} {...card} darkMode={darkMode} editMode={editMode} index={i} />
+                <CardItem
+                    key={`${i}-${cardKeys[i] ?? 0}`} {...card} darkMode={darkMode} editMode={editMode} index={i}
+                    otherCards={cards.map((c, j) => ({ i: j, title: c.title, rows: c.rows })).filter(c => c.i !== i)}
+                    onMoveRows={(rows, toIdx) => handleMoveRows(i, rows, toIdx)}
+                    externalRowOp={rowOps[i] ?? null}
+                    onToast={showToast}
+                    onDirty={markDirty}
+                    onDeleteCard={() => handleDeleteCard(i)}
+                />
             ))}
             {editMode && <AddRouteCard darkMode={darkMode} onAdd={handleAddCard} />}
         </div>
+
+        {/* ── Global Floating Save Bar (only when there are unsaved changes) ── */}
+        {editMode && hasChanges && (
+            <div style={{
+                position: 'fixed', bottom: '1.5rem', right: '1.5rem',
+                zIndex: 99999, animation: 'rl-float-in 0.28s ease-out',
+                display: 'flex', alignItems: 'center', gap: '0.5rem',
+                background: darkMode ? 'rgba(15,23,42,0.92)' : 'rgba(255,255,255,0.95)',
+                backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+                border: `1px solid ${darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0'}`,
+                borderRadius: '14px', padding: '0.5rem 0.7rem',
+                boxShadow: darkMode ? '0 8px 32px rgba(0,0,0,0.5)' : '0 8px 32px rgba(0,0,0,0.12)',
+            }}>
+                <i className="pi pi-exclamation-circle" style={{ fontSize: '0.72rem', color: darkMode ? '#fbbf24' : '#f59e0b' }} />
+                <span style={{ fontSize: '0.76rem', color: darkMode ? '#94a3b8' : '#64748b', fontWeight: 500, whiteSpace: 'nowrap' }}>Unsaved changes</span>
+                <div style={{ width: '1px', height: '16px', background: darkMode ? 'rgba(255,255,255,0.1)' : '#e2e8f0' }} />
+                <button
+                    onClick={handleSaveAll}
+                    style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', padding: '0.38rem 0.9rem', borderRadius: '8px', border: 'none', background: 'linear-gradient(135deg, #22c55e, #16a34a)', color: '#fff', fontSize: '0.78rem', fontWeight: 700, cursor: 'pointer', boxShadow: '0 2px 8px rgba(34,197,94,0.4)', transition: 'opacity 0.15s' }}
+                    onMouseEnter={e => e.currentTarget.style.opacity = '0.85'}
+                    onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+                >
+                    <i className="pi pi-check" style={{ fontSize: '0.65rem' }} /> Save
+                </button>
+            </div>
+        )}
+
+        {/* ── Exit Edit Mode Modal ── */}
+        {exitPending && (
+            <div style={{
+                position: 'fixed', inset: 0, zIndex: 999998,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                backdropFilter: 'blur(4px)', WebkitBackdropFilter: 'blur(4px)',
+                background: 'rgba(0,0,0,0.4)',
+            }}>
+                <div style={{
+                    width: '340px', borderRadius: '18px', overflow: 'hidden',
+                    background: darkMode ? '#1e293b' : '#fff',
+                    boxShadow: darkMode ? '0 25px 60px rgba(0,0,0,0.6)' : '0 25px 60px rgba(0,0,0,0.18)',
+                    animation: 'rl-float-in 0.25s ease-out',
+                }}>
+                    <div style={{ background: 'linear-gradient(135deg, #6366f1, #818cf8)', padding: '1.25rem 1.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                            <div style={{ width: '38px', height: '38px', borderRadius: '10px', background: 'rgba(255,255,255,0.22)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                <i className="pi pi-exclamation-triangle" style={{ fontSize: '1rem', color: '#fff' }} />
+                            </div>
+                            <div>
+                                <div style={{ color: '#fff', fontWeight: 800, fontSize: '0.95rem' }}>Exit Edit Mode?</div>
+                                <div style={{ color: 'rgba(255,255,255,0.75)', fontSize: '0.74rem', marginTop: '2px' }}>You have unsaved changes</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div style={{ padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                        <p style={{ margin: '0 0 0.25rem', fontSize: '0.82rem', color: darkMode ? '#94a3b8' : '#64748b', lineHeight: 1.55 }}>
+                            If you exit now, all unsaved changes will be lost. What would you like to do?
+                        </p>
+                        <button
+                            onClick={() => { handleSaveAll(); onExitDecision?.('exit'); }}
+                            style={{ width: '100%', padding: '0.62rem', borderRadius: '10px', border: 'none', background: 'linear-gradient(135deg, #22c55e, #16a34a)', color: '#fff', fontWeight: 700, fontSize: '0.84rem', cursor: 'pointer', boxShadow: '0 3px 10px rgba(34,197,94,0.35)', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem', transition: 'opacity 0.15s' }}
+                            onMouseEnter={e => e.currentTarget.style.opacity = '0.88'}
+                            onMouseLeave={e => e.currentTarget.style.opacity = '1'}
+                        >
+                            <i className="pi pi-check" style={{ fontSize: '0.75rem' }} /> Save &amp; Exit
+                        </button>
+                        <button
+                            onClick={() => { handleDiscardAll(); onExitDecision?.('exit'); }}
+                            style={{ width: '100%', padding: '0.62rem', borderRadius: '10px', border: `1px solid ${darkMode ? 'rgba(255,255,255,0.12)' : '#e2e8f0'}`, background: 'transparent', color: darkMode ? '#f87171' : '#ef4444', fontWeight: 600, fontSize: '0.84rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem', transition: 'background 0.15s' }}
+                            onMouseEnter={e => e.currentTarget.style.background = darkMode ? 'rgba(239,68,68,0.1)' : '#fff5f5'}
+                            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                        >
+                            <i className="pi pi-times" style={{ fontSize: '0.75rem' }} /> Discard &amp; Exit
+                        </button>
+                        <button
+                            onClick={() => onExitDecision?.('cancel')}
+                            style={{ width: '100%', padding: '0.5rem', borderRadius: '10px', border: 'none', background: 'transparent', color: darkMode ? '#475569' : '#94a3b8', fontSize: '0.78rem', cursor: 'pointer', transition: 'color 0.15s' }}
+                            onMouseEnter={e => e.currentTarget.style.color = darkMode ? '#94a3b8' : '#64748b'}
+                            onMouseLeave={e => e.currentTarget.style.color = darkMode ? '#475569' : '#94a3b8'}
+                        >
+                            Keep Editing
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {/* ── Global Toasts ── */}
+        <div style={{ position: 'fixed', top: '68px', right: '1.5rem', zIndex: 999999, display: 'flex', flexDirection: 'column', gap: '0.5rem', pointerEvents: 'none' }}>
+            {toasts.map(t => (
+                <div key={t.id} style={{
+                    display: 'flex', alignItems: 'center', gap: '0.65rem',
+                    padding: '0.7rem 1rem', borderRadius: '12px',
+                    background: t.type === 'error'
+                        ? (darkMode ? 'rgba(239,68,68,0.92)' : '#ef4444')
+                        : t.type === 'warn'
+                        ? (darkMode ? 'rgba(245,158,11,0.92)' : '#f59e0b')
+                        : (darkMode ? 'rgba(16,185,129,0.92)' : '#10b981'),
+                    color: '#fff', fontWeight: 600, fontSize: '0.82rem',
+                    boxShadow: t.type === 'error' ? '0 4px 18px rgba(239,68,68,0.45)' : t.type === 'warn' ? '0 4px 18px rgba(245,158,11,0.45)' : '0 4px 18px rgba(16,185,129,0.45)',
+                    animation: 'rl-toast-in 0.28s ease-out',
+                    backdropFilter: 'blur(8px)', minWidth: '200px',
+                    pointerEvents: 'none',
+                }}>
+                    <i className={`pi ${t.type === 'error' ? 'pi-trash' : t.type === 'warn' ? 'pi-undo' : 'pi-check-circle'}`} style={{ fontSize: '0.95rem' }} />
+                    {t.message}
+                </div>
+            ))}
+        </div>
+        </>
     );
 }
